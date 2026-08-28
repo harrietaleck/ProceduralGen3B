@@ -26,3 +26,7 @@ Saved/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Editor / local tooling (not part of the game project)
+.cursor/
+.mcp.json
