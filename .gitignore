@@ -30,3 +30,5 @@ Thumbs.db
 # Editor / local tooling (not part of the game project)
 .cursor/
 .mcp.json
+.collision_fix/
+Config/DefaultEditorPerProjectUserSettings.ini
