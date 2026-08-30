@@ -31,8 +31,8 @@ Thumbs.db
 .cursor/
 .mcp.json
 .collision_fix/
+Scripts/
 Config/DefaultEditorPerProjectUserSettings.ini
-Scripts/__pycache__/
 
 # Scratch editor levels
 Content/Untitled.umap
