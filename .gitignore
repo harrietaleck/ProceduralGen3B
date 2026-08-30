@@ -32,3 +32,11 @@ Thumbs.db
 .mcp.json
 .collision_fix/
 Config/DefaultEditorPerProjectUserSettings.ini
+Scripts/__pycache__/
+
+# Scratch editor levels
+Content/Untitled.umap
+Content/Untitled_HLOD0_Instancing.uasset
+Content/BottledTide/Maps/Untitled.umap
+Content/__ExternalActors__/
+Content/__ExternalObjects__/
