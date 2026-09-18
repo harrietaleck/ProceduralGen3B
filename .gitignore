@@ -26,3 +26,17 @@ Saved/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Editor / local tooling (not part of the game project)
+.cursor/
+.mcp.json
+.collision_fix/
+Scripts/
+Config/DefaultEditorPerProjectUserSettings.ini
+
+# Scratch editor levels
+Content/Untitled.umap
+Content/Untitled_HLOD0_Instancing.uasset
+Content/BottledTide/Maps/Untitled.umap
+Content/__ExternalActors__/
+Content/__ExternalObjects__/

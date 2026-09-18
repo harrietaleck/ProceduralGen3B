@@ -10,22 +10,6 @@
 			"TargetAllowList": [
 				"Editor"
 			]
-		},
-		{
-			"Name": "ModelContextProtocol",
-			"Enabled": true
-		},
-		{
-			"Name": "EditorToolset",
-			"Enabled": true
-		},
-		{
-			"Name": "AllToolsets",
-			"Enabled": true
-		},
-		{
-			"Name": "PythonScriptPlugin",
-			"Enabled": true
 		}
 	]
 }
