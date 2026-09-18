@@ -1,0 +1,285 @@
+; =====================================================================
+; BP_ProceduralJungleGenerator  (parent: Actor)
+; Builds the Isle of Marrow Canopy at BeginPlay on a 10x10 jittered grid.
+;
+; Order of work:
+;   0. ApplyDifficulty   pick tuning values for Corsair / Captain / Legend
+;   1. seed              fixed seed = repeatable jungle, else a new logged seed
+;   2. mesh pools        3 trees + 1 boulder
+;   3. PlanCells         decide what each cell may hold (the gameplay rules)
+;   4. VerifyRoute       prove every fragment is reachable before spawning
+;   5. spawn             place what the plan allows
+;   6. ConfigureRun      tell BP_GameManager the fragment count and tier
+;
+; Editable variables (Details panel): GridSize, CellSize, SpawnChance,
+; BoulderChance, PositionJitter, MinScale, MaxScale, RotationRange,
+; bUseFixedSeed, RandomSeed, CollectibleCount, ObjectiveDepth,
+; KeepClearRadius, KeepClearActors, PrintPlanMap, Difficulty.
+;
+; IMPORTANT Blueprint rule used throughout: a random node (or any pure node)
+; is re-run every time something reads it. Any value needed in more than one
+; place is stored in a variable first (CellRoll, CellLocation, NearRoute,
+; CurCell) so it is only rolled once.
+; =====================================================================
+(event EventBeginPlay
+  ; --- 0. DIFFICULTY: Corsair / Captain / Legend set counts, density and route width ---
+  (CallFunction|ApplyDifficulty)
+  (Development|PrintString (Utilities|String|Append (Utilities|String|Append (Utilities|String|Append "Difficulty: " (Variables|Default|GetDifficulty)) " - fragments: ") (Utilities|String|ToString(Integer) (Variables|Default|GetCollectibleCount))))
+
+  ; --- 1. SEED: fixed seed = repeatable jungle, otherwise pick a new one and log it ---
+  (if (not (Variables|Default|GetUseFixedSeed))
+    (Variables|Default|SetRandomSeed (Math|Random|RandomInteger 2147483647)))
+  (Math|Random|SetRandomStreamSeed (Variables|Default|GetJungleStream) (Variables|Default|GetRandomSeed))
+  (Development|PrintString (Utilities|String|Append "Jungle seed: " (Utilities|String|ToString(Integer) (Variables|Default|GetRandomSeed))))
+
+  ; --- 2. MESH POOLS ---
+  (Utilities|Array|Clear (Variables|Default|GetTreeMeshes))
+  (Utilities|Array|Clear (Variables|Default|GetBoulderMeshes))
+  (Utilities|Array|Add (Variables|Default|GetTreeMeshes) "/PCG/SampleContent/SimpleForest/Meshes/PCG_Tree_01.PCG_Tree_01")
+  (Utilities|Array|Add (Variables|Default|GetTreeMeshes) "/PCG/SampleContent/SimpleForest/Meshes/PCG_Tree_02.PCG_Tree_02")
+  (Utilities|Array|Add (Variables|Default|GetTreeMeshes) "/PCG/SampleContent/SimpleForest/Meshes/PCG_Tree_03.PCG_Tree_03")
+  (Utilities|Array|Add (Variables|Default|GetBoulderMeshes) "/PCG/SampleContent/SimpleForest/Meshes/PCG_Boulder_02.PCG_Boulder_02")
+
+  ; --- 3. RULES: route, safe zones, relic fragment cells ---
+  (CallFunction|PlanCells)
+  (if (Variables|Default|GetPrintPlanMap)
+    (CallFunction|PrintPlan))
+
+  ; --- 4. PROOF: every fragment must be reachable from the entry along planned cells ---
+  (CallFunction|VerifyRoute)
+
+  ; --- 5. SPAWN: cell position = index * CellSize - half the grid (grid is centred on this actor) ---
+  (bind origin (Transformation|GetActorLocation))
+  (bind cellSize (Variables|Default|GetCellSize))
+  (bind jitter (Variables|Default|GetPositionJitter))
+  (bind n (Variables|Default|GetGridSize))
+  (bind halfGrid (* (* (Math|Conversions|ToFloat(Integer) n) cellSize) 0.5))
+  (for ix (range n)
+    (for iy (range n)
+      ; cells beside the route: no boulders and only a quarter of the usual jitter,
+      ; so props cannot lean into the corridor and pinch it
+      (Variables|Default|SetNearRoute (CallFunction|IsNearRoute :Col ix :Row iy))
+      ; cell centre plus random jitter, stored once in CellLocation
+      (Variables|Default|SetCellLocation (+ origin (Math|Vector|MakeVector (+ (- (* (Math|Conversions|ToFloat(Integer) ix) cellSize) halfGrid) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetJungleStream) (- 0.0 (* jitter (select (Variables|Default|GetNearRoute) 0.25 1.0))) (* jitter (select (Variables|Default|GetNearRoute) 0.25 1.0)))) (+ (- (* (Math|Conversions|ToFloat(Integer) iy) cellSize) halfGrid) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetJungleStream) (- 0.0 (* jitter (select (Variables|Default|GetNearRoute) 0.25 1.0))) (* jitter (select (Variables|Default|GetNearRoute) 0.25 1.0)))) 0.0)))
+      (if (== (Utilities|Array|Get(acopy) (Variables|Default|GetCellType) (+ (* ix n) iy)) 3)
+        ; RELIC FRAGMENT cell (chosen by PlanCells)
+        (Game|SpawnActorfromClass :Class "/Game/BottledTide/Blueprints/BP_Collectible.BP_Collectible_C" :SpawnTransform (Math|Transform|MakeTransform (Variables|Default|GetCellLocation)) :CollisionHandlingOverride "AlwaysSpawn")
+        (elif (== (Utilities|Array|Get(acopy) (Variables|Default|GetCellType) (+ (* ix n) iy)) 0)
+          ; FREE cell: one roll decides prop or empty (type 1 cells stay clear)
+          (Variables|Default|SetCellRoll (Math|Random|RandomFloatFromStream (Variables|Default|GetJungleStream)))
+          (if (< (Variables|Default|GetCellRoll) (Variables|Default|GetSpawnChance))
+            (CallFunction|SpawnProp :Location (Variables|Default|GetCellLocation) :AllowBoulder (not (Variables|Default|GetNearRoute))))))))
+
+  ; --- 6. TELL THE MANAGER how many fragments this run needs, and the tier for the HUD ---
+  (bind mgrActor (Actor|GetActorOfClass "/Game/BottledTide/Blueprints/BP_GameManager.BP_GameManager_C"))
+  (bind mgr (Utilities|Casting|CastToBP_GameManager mgrActor)
+    (:then
+      (Class|BPGameManager|ConfigureRun mgr (Variables|Default|GetCollectibleCount) (Variables|Default|GetDifficulty)))
+    (:CastFailed)))
+
+
+; ---------------------------------------------------------------------
+; ApplyDifficulty - the Difficulty text (Corsair / Captain / Legend) sets the
+; generator's tuning values. Each tier changes real gameplay, not just a label:
+;   Corsair : 3 fragments, sparse jungle, few boulders, fragments close in, WIDE trail
+;   Captain : 5 fragments, standard density, fragments further in
+;   Legend  : 7 fragments, dense jungle, more boulders, fragments deep in
+; Any other text (e.g. "Custom") leaves the Details-panel values untouched.
+; ---------------------------------------------------------------------
+(fn ApplyDifficulty ()
+  (Variables|Default|SetWideTrail false)
+  (if (Utilities|String|Equal,CaseInsensitive(String) (Variables|Default|GetDifficulty) "Corsair")
+    (Variables|Default|SetCollectibleCount 3)
+    (Variables|Default|SetSpawnChance 0.4)
+    (Variables|Default|SetBoulderChance 0.1)
+    (Variables|Default|SetObjectiveDepth 0.3)
+    (Variables|Default|SetWideTrail true)
+    (elif (Utilities|String|Equal,CaseInsensitive(String) (Variables|Default|GetDifficulty) "Captain")
+      (Variables|Default|SetCollectibleCount 5)
+      (Variables|Default|SetSpawnChance 0.55)
+      (Variables|Default|SetBoulderChance 0.25)
+      (Variables|Default|SetObjectiveDepth 0.4)
+      (elif (Utilities|String|Equal,CaseInsensitive(String) (Variables|Default|GetDifficulty) "Legend")
+        (Variables|Default|SetCollectibleCount 7)
+        (Variables|Default|SetSpawnChance 0.7)
+        (Variables|Default|SetBoulderChance 0.35)
+        (Variables|Default|SetObjectiveDepth 0.55)
+        (else
+          (Development|PrintString "Difficulty: custom values from the Details panel"))))))
+
+
+; ---------------------------------------------------------------------
+; PlanCells - decides what every grid cell may contain BEFORE anything is spawned.
+; CellType per cell (index = column * GridSize + row):
+;   0 = free (may get a prop)   1 = kept clear (route / safe zone)   3 = relic fragment
+; This is where the gameplay rules constrain the randomness.
+; ---------------------------------------------------------------------
+(fn PlanCells ()
+  ; 1. RESET: every cell starts free
+  (Utilities|Array|Clear (Variables|Default|GetCellType))
+  (Utilities|Array|Clear (Variables|Default|GetTrailRow))
+  (bind n (Variables|Default|GetGridSize))
+  (for i (range (* n n))
+    (Utilities|Array|Add (Variables|Default|GetCellType) 0))
+
+  ; 2. MAIN TRAIL: a clear route from the entry column (nearest the ship) to the far column.
+  ; It starts in the middle row and wanders up/down at random. WideTrail (Corsair) clears
+  ; a second row beside it so the route is two cells wide.
+  (Variables|Default|SetTrailCursor (Math|Float|Truncate (* (Math|Conversions|ToFloat(Integer) n) 0.5)))
+  (for col (range n)
+    (Utilities|Array|Add (Variables|Default|GetTrailRow) (Variables|Default|GetTrailCursor))
+    (Utilities|Array|SetArrayElem (Variables|Default|GetCellType) (+ (* col n) (Variables|Default|GetTrailCursor)) 1 false)
+    (if (Variables|Default|GetWideTrail)
+      (Utilities|Array|SetArrayElem (Variables|Default|GetCellType) (+ (* col n) (select (< (+ (Variables|Default|GetTrailCursor) 1) n) (+ (Variables|Default|GetTrailCursor) 1) (- (Variables|Default|GetTrailCursor) 1))) 1 false))
+    ; wander one row up, down or stay, then clamp inside the grid
+    (Variables|Default|SetTrailCursor (+ (Variables|Default|GetTrailCursor) (Math|Random|RandomIntegerInRangeFromStream (Variables|Default|GetJungleStream) -1 1)))
+    (Variables|Default|SetTrailCursor (select (< (Variables|Default|GetTrailCursor) 0) 0 (select (> (Variables|Default|GetTrailCursor) (- n 1)) (- n 1) (Variables|Default|GetTrailCursor))))
+    (Utilities|Array|SetArrayElem (Variables|Default|GetCellType) (+ (* col n) (Variables|Default|GetTrailCursor)) 1 false)
+    (if (Variables|Default|GetWideTrail)
+      (Utilities|Array|SetArrayElem (Variables|Default|GetCellType) (+ (* col n) (select (< (+ (Variables|Default|GetTrailCursor) 1) n) (+ (Variables|Default|GetTrailCursor) 1) (- (Variables|Default|GetTrailCursor) 1))) 1 false)))
+
+  ; 3. SAFE ZONES: keep cells clear within KeepClearRadius of each KeepClearActors entry
+  (bind origin (Transformation|GetActorLocation))
+  (bind cs (Variables|Default|GetCellSize))
+  (bind half (* (* (Math|Conversions|ToFloat(Integer) n) cs) 0.5))
+  (for safeActor (Variables|Default|GetKeepClearActors)
+    (Utilities|IsValid safeActor
+      (:"Is Valid"
+        (bind safePos (Transformation|GetActorLocation safeActor))
+        (for sc (range n)
+          (for sr (range n)
+            (if (< (Math|Vector|Distance2D(Vector) (+ origin (Math|Vector|MakeVector (- (* (Math|Conversions|ToFloat(Integer) sc) cs) half) (- (* (Math|Conversions|ToFloat(Integer) sr) cs) half) 0.0)) safePos) (Variables|Default|GetKeepClearRadius))
+              (Utilities|Array|SetArrayElem (Variables|Default|GetCellType) (+ (* sc n) sr) 1 false)))))
+      (:"Is Not Valid")))
+
+  ; 4. RELIC FRAGMENTS: exactly CollectibleCount, only in the far part of the grid
+  ; (ObjectiveDepth), only in free cells. Each one gets a clear corridor straight to the trail.
+  (bind minCol (Math|Float|Truncate (* (Variables|Default|GetObjectiveDepth) (Math|Conversions|ToFloat(Integer) n))))
+  (for k (range (Variables|Default|GetCollectibleCount))
+    (Variables|Default|SetCollectiblePlaced false)
+    ; up to 40 random attempts to find a free cell for this fragment
+    (for attempt (range 40)
+      (if (not (Variables|Default|GetCollectiblePlaced))
+        (Variables|Default|SetPickX (Math|Random|RandomIntegerInRangeFromStream (Variables|Default|GetJungleStream) minCol (- n 1)))
+        (Variables|Default|SetPickY (Math|Random|RandomIntegerInRangeFromStream (Variables|Default|GetJungleStream) 0 (- n 1)))
+        (if (== (Utilities|Array|Get(acopy) (Variables|Default|GetCellType) (+ (* (Variables|Default|GetPickX) n) (Variables|Default|GetPickY))) 0)
+          (Utilities|Array|SetArrayElem (Variables|Default|GetCellType) (+ (* (Variables|Default|GetPickX) n) (Variables|Default|GetPickY)) 3 false)
+          (Variables|Default|SetCollectiblePlaced true)
+          ; carve a straight clear corridor from the fragment to the trail in its column
+          (bind trailRow (Utilities|Array|Get(acopy) (Variables|Default|GetTrailRow) (Variables|Default|GetPickX)))
+          (bind lo (select (< (Variables|Default|GetPickY) trailRow) (Variables|Default|GetPickY) trailRow))
+          (bind hi (select (< (Variables|Default|GetPickY) trailRow) trailRow (Variables|Default|GetPickY)))
+          (for j (range lo (+ hi 1))
+            (if (== (Utilities|Array|Get(acopy) (Variables|Default|GetCellType) (+ (* (Variables|Default|GetPickX) n) j)) 0)
+              (Utilities|Array|SetArrayElem (Variables|Default|GetCellType) (+ (* (Variables|Default|GetPickX) n) j) 1 false))))))
+    (if (not (Variables|Default|GetCollectiblePlaced))
+      (Development|PrintString "Jungle: could not place a relic fragment (no free cell found)"))))
+
+
+; ---------------------------------------------------------------------
+; SpawnProp - spawns ONE environmental prop at Location.
+; AllowBoulder is false for cells beside the route: boulders are wide and low,
+; so they could pinch the trail. Each random value is read exactly once.
+; ---------------------------------------------------------------------
+(fn SpawnProp (Location AllowBoulder)
+  ; random yaw within RotationRange and a random scale on each axis
+  (bind prop (Game|SpawnActorfromClass :Class "/Script/Engine.StaticMeshActor" :SpawnTransform (Math|Transform|MakeTransform Location (Math|Rotator|MakeRotator 0.0 0.0 (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetJungleStream) 0.0 (Variables|Default|GetRotationRange))) (Math|Vector|MakeVector (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetJungleStream) (Variables|Default|GetMinScale) (Variables|Default|GetMaxScale)) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetJungleStream) (Variables|Default|GetMinScale) (Variables|Default|GetMaxScale)) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetJungleStream) (Variables|Default|GetMinScale) (Variables|Default|GetMaxScale)))) :CollisionHandlingOverride "AlwaysSpawn"))
+  (bind propMesh (Utilities|Casting|CastToStaticMeshActor prop)
+    (:then
+      ; boulder (if allowed and BoulderChance rolls true) or a random tree
+      (if (and AllowBoulder (< (Math|Random|RandomFloatFromStream (Variables|Default|GetJungleStream)) (Variables|Default|GetBoulderChance)))
+        (Components|StaticMesh|SetStaticMesh (Class|StaticMeshActor|GetStaticMeshComponent propMesh) (Utilities|Array|RandomArrayItemfromStream (Variables|Default|GetBoulderMeshes) (Variables|Default|GetJungleStream)))
+        (else
+          (Components|StaticMesh|SetStaticMesh (Class|StaticMeshActor|GetStaticMeshComponent propMesh) (Utilities|Array|RandomArrayItemfromStream (Variables|Default|GetTreeMeshes) (Variables|Default|GetJungleStream))))))
+    (:CastFailed)))
+
+
+; ---------------------------------------------------------------------
+; PrintPlan - debug helper. Prints the plan as text, one line per row.
+; Columns run left->right from the ship side to the far side.
+;   F = relic fragment   - = kept clear (route / safe zone)   . = free cell (may hold a prop)
+; ---------------------------------------------------------------------
+(fn PrintPlan ()
+  (bind n (Variables|Default|GetGridSize))
+  (for row (range n)
+    (Variables|Default|SetMapRowText "")
+    (for col (range n)
+      (Variables|Default|SetMapRowText (Utilities|String|Append (Variables|Default|GetMapRowText) (select (== (Utilities|Array|Get(acopy) (Variables|Default|GetCellType) (+ (* col n) row)) 3) "F" (select (== (Utilities|Array|Get(acopy) (Variables|Default|GetCellType) (+ (* col n) row)) 1) "-" ".")))))
+    (Development|PrintString (Variables|Default|GetMapRowText))))
+
+
+; ---------------------------------------------------------------------
+; RouteAt - is grid cell (Col, Row) inside the grid AND part of the planned route
+; (type 1 = kept clear, 3 = relic fragment)? Out-of-range cells are simply "no".
+; ---------------------------------------------------------------------
+(fn RouteAt (Col Row)
+  (bind n (Variables|Default|GetGridSize))
+  (if (and (and (>= Col 0) (< Col n)) (and (>= Row 0) (< Row n)))
+    (bind t (Utilities|Array|Get(acopy) (Variables|Default|GetCellType) (+ (* Col n) Row)))
+    (return (or (== t 1) (== t 3)))
+    (else
+      (return false))))
+
+
+; ---------------------------------------------------------------------
+; IsNearRoute - true if any of the 4 side-neighbours of (Col, Row) is a route cell.
+; ---------------------------------------------------------------------
+(fn IsNearRoute (Col Row)
+  (bind east (CallFunction|RouteAt :Col (+ Col 1) :Row Row))
+  (bind west (CallFunction|RouteAt :Col (- Col 1) :Row Row))
+  (bind north (CallFunction|RouteAt :Col Col :Row (+ Row 1)))
+  (bind south (CallFunction|RouteAt :Col Col :Row (- Row 1)))
+  (return (or (or east west) (or north south))))
+
+
+; ---------------------------------------------------------------------
+; VisitCell - one step of the flood fill: if (Col, Row) is a route cell that has not
+; been visited yet, mark it visited and queue it so its neighbours get explored.
+; ---------------------------------------------------------------------
+(fn VisitCell (Col Row)
+  (bind n (Variables|Default|GetGridSize))
+  (if (CallFunction|RouteAt :Col Col :Row Row)
+    (if (== (Utilities|Array|Get(acopy) (Variables|Default|GetVisited) (+ (* Col n) Row)) 0)
+      (Utilities|Array|SetArrayElem (Variables|Default|GetVisited) (+ (* Col n) Row) 1 false)
+      (Utilities|Array|Add (Variables|Default|GetRouteQueue) (+ (* Col n) Row)))))
+
+
+; ---------------------------------------------------------------------
+; VerifyRoute - proves the plan is playable BEFORE anything is spawned.
+; Flood fill (breadth-first search) from the entry cell (first column, on the trail)
+; through route cells only, then counts how many relic fragments it reached.
+; Fragment cells are route cells, so a fragment that is walled in would show up here.
+; NOTE: the current cell is stored in CurCell first, because a Blueprint value that is
+; only read (not stored) is recomputed each time it is used - after QueueHead has moved on.
+; It reports PASS/FAIL in the log; it does not repair a failed plan.
+; ---------------------------------------------------------------------
+(fn VerifyRoute ()
+  (bind n (Variables|Default|GetGridSize))
+  (Utilities|Array|Clear (Variables|Default|GetVisited))
+  (Utilities|Array|Clear (Variables|Default|GetRouteQueue))
+  (for i (range (* n n))
+    (Utilities|Array|Add (Variables|Default|GetVisited) 0))
+  (Variables|Default|SetQueueHead 0)
+  ; seed the queue with the entry cell (column 0, on the trail)
+  (Variables|Default|SetCurCell (Utilities|Array|Get(acopy) (Variables|Default|GetTrailRow) 0))
+  (Utilities|Array|SetArrayElem (Variables|Default|GetVisited) (Variables|Default|GetCurCell) 1 false)
+  (Utilities|Array|Add (Variables|Default|GetRouteQueue) (Variables|Default|GetCurCell))
+  ; pop a cell, then visit its four neighbours (column = cell / GridSize, row = the remainder)
+  (while (< (Variables|Default|GetQueueHead) (Utilities|Array|Length (Variables|Default|GetRouteQueue)))
+    (Variables|Default|SetCurCell (Utilities|Array|Get(acopy) (Variables|Default|GetRouteQueue) (Variables|Default|GetQueueHead)))
+    (Variables|Default|SetQueueHead (+ (Variables|Default|GetQueueHead) 1))
+    (CallFunction|VisitCell :Col (+ (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) (Variables|Default|GetCurCell)) (Math|Conversions|ToFloat(Integer) n))) 1) :Row (- (Variables|Default|GetCurCell) (* (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) (Variables|Default|GetCurCell)) (Math|Conversions|ToFloat(Integer) n))) n)))
+    (CallFunction|VisitCell :Col (- (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) (Variables|Default|GetCurCell)) (Math|Conversions|ToFloat(Integer) n))) 1) :Row (- (Variables|Default|GetCurCell) (* (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) (Variables|Default|GetCurCell)) (Math|Conversions|ToFloat(Integer) n))) n)))
+    (CallFunction|VisitCell :Col (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) (Variables|Default|GetCurCell)) (Math|Conversions|ToFloat(Integer) n))) :Row (+ (- (Variables|Default|GetCurCell) (* (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) (Variables|Default|GetCurCell)) (Math|Conversions|ToFloat(Integer) n))) n)) 1))
+    (CallFunction|VisitCell :Col (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) (Variables|Default|GetCurCell)) (Math|Conversions|ToFloat(Integer) n))) :Row (- (- (Variables|Default|GetCurCell) (* (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) (Variables|Default|GetCurCell)) (Math|Conversions|ToFloat(Integer) n))) n)) 1)))
+  ; count fragments (type 3) that the flood fill reached
+  (Variables|Default|SetReachableFragments 0)
+  (for k (range (* n n))
+    (if (== (Utilities|Array|Get(acopy) (Variables|Default|GetCellType) k) 3)
+      (if (== (Utilities|Array|Get(acopy) (Variables|Default|GetVisited) k) 1)
+        (Variables|Default|SetReachableFragments (+ (Variables|Default|GetReachableFragments) 1)))))
+  ; report the result in the log
+  (if (== (Variables|Default|GetReachableFragments) (Variables|Default|GetCollectibleCount))
+    (Development|PrintString (Utilities|String|Append (Utilities|String|Append (Utilities|String|Append "Route check: PASS - " (Utilities|String|ToString(Integer) (Variables|Default|GetReachableFragments))) " of ") (Utilities|String|ToString(Integer) (Variables|Default|GetCollectibleCount))))
+    (else
+      (Development|PrintString (Utilities|String|Append (Utilities|String|Append (Utilities|String|Append "Route check: FAIL - only " (Utilities|String|ToString(Integer) (Variables|Default|GetReachableFragments))) " of ") (Utilities|String|ToString(Integer) (Variables|Default|GetCollectibleCount)))))))

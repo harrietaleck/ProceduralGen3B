@@ -1,0 +1,28 @@
+; =====================================================================
+; BP_Collectible  (parent: StaticMeshActor)  - the relic fragment
+; Components: StaticMeshComponent0 (the diamond, no collision),
+;             PickupSphere (160 cm overlap trigger), Glow (cyan point light),
+;             Spin (RotatingMovement, 90 deg/s yaw - replaces a Tick).
+; Spawned by BP_ProceduralJungleGenerator, one per fragment cell.
+; =====================================================================
+
+; BeginPlay: give the actor its look and make sure only the sphere reacts to the player.
+(event EventBeginPlay
+  (Components|StaticMesh|SetStaticMesh (Variables|StaticMeshActor|GetStaticMeshComponent) "/ControlRig/Controls/ControlRig_Diamond_solid.ControlRig_Diamond_solid")
+  ; the mesh itself must not block the player; the PickupSphere handles overlap
+  (Collision|SetCollisionProfileName (Variables|StaticMeshActor|GetStaticMeshComponent) "NoCollision")
+  (Transformation|SetActorScale3D self (Math|Vector|MakeVector 0.6 0.6 0.6)))
+
+; Picked up when the player walks into PickupSphere: tells BP_GameManager, then removes itself.
+(event OnComponentBeginOverlap(PickupSphere) (OverlappedComponent OtherActor OtherComp OtherBodyIndex bFromSweep SweepResult)
+  ; only the player can pick it up
+  (bind player (Utilities|Casting|CastToBP_Player OtherActor)
+    (:then
+      ; find the game manager, count this fragment, then destroy the pickup
+      (bind mgrActor (Actor|GetActorOfClass "/Game/BottledTide/Blueprints/BP_GameManager.BP_GameManager_C"))
+      (bind mgr (Utilities|Casting|CastToBP_GameManager mgrActor)
+        (:then
+          (Class|BPGameManager|CollectFragment mgr)
+          (Actor|DestroyActor self))
+        (:CastFailed)))
+    (:CastFailed)))

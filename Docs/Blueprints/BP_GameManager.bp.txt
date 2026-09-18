@@ -1,0 +1,61 @@
+; =====================================================================
+; BP_GameManager  (parent: Actor)  - tracks the objective and owns the HUD.
+; One instance is placed in the level. Event-driven: nothing runs per frame.
+; Variables: RequiredFragments, CollectedFragments, RunComplete, TierName, Hud.
+; =====================================================================
+
+; BeginPlay: reset the count, create the HUD, and read the fragment count from the generator.
+(event EventBeginPlay
+  (Variables|Default|SetCollectedFragments 0)
+  ; HUD
+  (bind widget (UserInterface|CreateWidget "/Game/BottledTide/UI/BP_GameHUD.BP_GameHUD_C" (Game|GetPlayerController 0)))
+  (bind hudRef (Utilities|Casting|CastToBP_GameHUD widget)
+    (:then
+      (Variables|Default|SetHud hudRef)
+      (UserInterface|Viewport|AddtoViewport hudRef)
+      ; REQUIRED = however many fragments the generator was told to place
+      (bind genActor (Actor|GetActorOfClass "/Game/BottledTide/Blueprints/BP_ProceduralJungleGenerator.BP_ProceduralJungleGenerator_C"))
+      (bind gen (Utilities|Casting|CastToBP_ProceduralJungleGenerator genActor)
+        (:then
+          (Variables|Default|SetRequiredFragments (Class|BPProceduralJungleGenerator|GetCollectibleCount gen))
+          (CallFunction|RefreshHud))
+        (:CastFailed
+          (CallFunction|RefreshHud))))
+    (:CastFailed)))
+
+; ConfigureRun - called by BP_ProceduralJungleGenerator once the difficulty tier is applied.
+; The generator is the source of truth for how many fragments exist.
+(fn ConfigureRun (Required Tier)
+  (Variables|Default|SetRequiredFragments Required)
+  (Variables|Default|SetTierName Tier)
+  (CallFunction|RefreshHud))
+
+; RefreshHud - pushes the current objective state and difficulty tier to the HUD widget.
+(fn RefreshHud ()
+  (Utilities|IsValid (Variables|Default|GetHud)
+    (:"Is Valid"
+      (Class|BPGameHUD|SetDifficulty (Variables|Default|GetHud) (Variables|Default|GetTierName))
+      (Class|BPGameHUD|SetProgress (Variables|Default|GetHud) (Variables|Default|GetCollectedFragments) (Variables|Default|GetRequiredFragments) (select (>= (Variables|Default|GetCollectedFragments) (Variables|Default|GetRequiredFragments)) "OBJECTIVE COMPLETE - Return to The Horizon's Debt." "Collect the remaining relic fragments.")))
+    (:"Is Not Valid")))
+
+; CollectFragment - called by a BP_Collectible when the player picks it up.
+; Adds one to the count, refreshes the HUD, and logs when the objective is complete.
+(fn CollectFragment ()
+  (Variables|Default|SetCollectedFragments (+ (Variables|Default|GetCollectedFragments) 1))
+  (CallFunction|RefreshHud)
+  (if (== (Variables|Default|GetCollectedFragments) (Variables|Default|GetRequiredFragments))
+    (Development|PrintString "OBJECTIVE COMPLETE - return to The Horizon's Debt")))
+
+; PlayerReachedShip - called by BP_ReturnZone when the player walks into the ship's zone.
+; The run only ends if every fragment has been collected; otherwise it just reminds the player.
+(fn PlayerReachedShip ()
+  (if (not (Variables|Default|GetRunComplete))
+    (if (>= (Variables|Default|GetCollectedFragments) (Variables|Default|GetRequiredFragments))
+      (Variables|Default|SetRunComplete true)
+      (Development|PrintString "You made it back. End where you started.")
+      (Utilities|IsValid (Variables|Default|GetHud)
+        (:"Is Valid"
+          (Class|BPGameHUD|ShowEndScreen (Variables|Default|GetHud)))
+        (:"Is Not Valid"))
+      (else
+        (Development|PrintString "The Horizon's Debt is waiting - but the relic fragments are not all collected yet.")))))

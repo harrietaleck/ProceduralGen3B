@@ -1,0 +1,21 @@
+; =====================================================================
+; BP_GameHUD  (Widget Blueprint)  - minimal, atmospheric HUD.
+; Widgets (top-left): FragmentsText, ObjectiveText, DifficultyText.
+; Widgets (centre, hidden until the run ends): EndBox with EndTitle / EndSubtitle.
+; Everything is driven by function calls from BP_GameManager - no Tick, no bindings.
+; =====================================================================
+
+; SetProgress - called by BP_GameManager whenever the objective changes.
+; Updates "Fragments: X / N" and the objective line.
+(fn SetProgress (Collected Required ObjectiveMessage)
+  (Class|Text|SetText :Text (Utilities|Text|ToText(String) (Utilities|String|Append (Utilities|String|Append (Utilities|String|Append "Fragments: " (Utilities|String|ToString(Integer) Collected)) " / ") (Utilities|String|ToString(Integer) Required))) :self (Variables|BP_GameHUD|GetFragmentsText))
+  (Class|Text|SetText :Text (Utilities|Text|ToText(String) ObjectiveMessage) :self (Variables|BP_GameHUD|GetObjectiveText)))
+
+; SetDifficulty - shows the current tier under the objective.
+(fn SetDifficulty (TierName)
+  (Class|Text|SetText :Text (Utilities|Text|ToText(String) (Utilities|String|Append "Difficulty: " TierName)) :self (Variables|BP_GameHUD|GetDifficultyText)))
+
+; ShowEndScreen - reveals the end-of-run text ("YOU MADE IT BACK." / "End where you started.").
+; Called once by BP_GameManager.
+(fn ShowEndScreen ()
+  (Widget|SetVisibility (Variables|BP_GameHUD|GetEndBox) "SelfHitTestInvisible"))

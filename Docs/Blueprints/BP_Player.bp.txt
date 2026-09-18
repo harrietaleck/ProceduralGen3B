@@ -1,0 +1,18 @@
+; =====================================================================
+; BP_Player  (parent: Character)  - first person, walking only, no combat.
+; Components: FirstPersonCamera (eye height 64 cm, follows the controller rotation).
+; Editable variable: LookSensitivity (default 0.6).
+;
+; Movement and look need per-frame input, so this is the only Tick in the game.
+; WASD walks (forward/back and strafe), the mouse looks.
+; =====================================================================
+(event EventTick (DeltaSeconds)
+  (bind pc (Game|GetPlayerController 0))
+  ; forward/back: W minus S (each is 1 when held, 0 otherwise)
+  (Pawn|Input|AddMovementInput self (Transformation|GetActorForwardVector) (- (select (Game|Player|IsInputKeyDown pc "W") 1.0 0.0) (select (Game|Player|IsInputKeyDown pc "S") 1.0 0.0)))
+  ; strafe: D minus A
+  (Pawn|Input|AddMovementInput self (Transformation|GetActorRightVector) (- (select (Game|Player|IsInputKeyDown pc "D") 1.0 0.0) (select (Game|Player|IsInputKeyDown pc "A") 1.0 0.0)))
+  ; mouse look: horizontal turns the body (yaw), vertical tilts the camera (pitch, inverted)
+  (bind (dx dy) (Game|Player|GetInputMouseDelta pc))
+  (Pawn|Input|AddControllerYawInput self (* dx (Variables|Default|GetLookSensitivity)))
+  (Pawn|Input|AddControllerPitchInput self (* (- 0.0 dy) (Variables|Default|GetLookSensitivity))))

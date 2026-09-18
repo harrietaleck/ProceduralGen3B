@@ -1,0 +1,17 @@
+; =====================================================================
+; BP_ReturnZone  (parent: Actor)  - trigger volume around the ship (The Horizon's Debt).
+; Component: Zone (box, extent 450 x 800 x 250 cm, overlap events on).
+; Placed by hand in the level and never generated: the destination stays the same.
+; When the player walks in, BP_GameManager decides whether the run is complete.
+; =====================================================================
+(event OnComponentBeginOverlap(Zone) (OverlappedComponent OtherActor OtherComp OtherBodyIndex bFromSweep SweepResult)
+  ; only the player triggers the return
+  (bind player (Utilities|Casting|CastToBP_Player OtherActor)
+    (:then
+      ; ask the manager: all fragments collected? then end the run, otherwise remind the player
+      (bind mgrActor (Actor|GetActorOfClass "/Game/BottledTide/Blueprints/BP_GameManager.BP_GameManager_C"))
+      (bind mgr (Utilities|Casting|CastToBP_GameManager mgrActor)
+        (:then
+          (Class|BPGameManager|PlayerReachedShip mgr))
+        (:CastFailed)))
+    (:CastFailed)))
