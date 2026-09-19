@@ -1,0 +1,443 @@
+; =====================================================================
+; BP_PerlinNoiseTerrain  (parent: Actor)   - ICE TASK 3: PERLIN NOISE
+; A small terrain built from Unreal's Perlin noise, with a route that leaves HOME on the
+; map edge, wanders through the terrain without using very steep ground, and loops back
+; to HOME. Separate from the Bottled Tide game: it uses none of the game's Blueprints.
+;
+;   PERLIN NOISE -> HEIGHTS -> TERRAIN MESH -> SLOPE-LIMITED LOOP -> ROAD + HOME MARKER
+;
+; Editable variables (Details panel, category default):
+;   MapSize          points per side of the terrain grid (default 32)
+;   CellSize         distance between grid points in cm (default 100)
+;   NoiseScale       Perlin frequency: small = broad hills, large = busy terrain (0.11)
+;   HeightMultiplier converts noise (about -1..1) into cm of height (450)
+;   Seed             different Seed = different terrain (1001)
+;   MaxSlopeDegrees  steepest ground the route may use, in degrees (30)
+;
+; Components: Terrain (ProceduralMesh), PathRoad (yellow road pieces), HomeMarker (beacon and
+; pad), SeedText and HomeText (flat labels for top-down screenshots).
+;
+; Grid index rule used everywhere:  index = column * MapSize + row.
+; Column 0 is the map edge where HOME is.
+;
+; Blueprint rule used throughout: a value that is only READ (not stored) is recomputed each
+; time it is used. Anything needed more than once (CurIdx, NIdx, StepLen, StepSlope,
+; NewCost, CurCol, CurRow ...) is stored in a variable first.
+; =====================================================================
+
+; ---------------------------------------------------------------------
+; Construction Script - runs whenever the actor is placed or any variable changes, so
+; changing Seed regenerates the terrain and route immediately, no need to press Play.
+; (This is the built-in entry node connected to a call to Rebuild.)
+; ---------------------------------------------------------------------
+;   UserConstructionScript -> Rebuild
+
+; ---------------------------------------------------------------------
+; Rebuild - builds the whole scene from the current variables.
+; If a seed has no loop at MaxSlopeDegrees, the limit is relaxed by 6 degrees at a time
+; (at most 3 times) and the result is reported, so the world is never left without a route.
+; ---------------------------------------------------------------------
+(fn Rebuild ()
+  (CallFunction|GenerateHeights)
+  (CallFunction|BuildTerrainMesh)
+  (Variables|Default|SetLoopOk false)
+  (for attempt (range 4)
+    (if (not (Variables|Default|GetLoopOk))
+      (Variables|Default|SetUsedSlopeDeg (+ (Variables|Default|GetMaxSlopeDegrees) (* 6.0 (Math|Conversions|ToFloat(Integer) attempt))))
+      (Variables|Default|SetSlopeLimit (Math|Trig|Tan(Degrees) (Variables|Default|GetUsedSlopeDeg)))
+      (CallFunction|BuildLoop)))
+  (CallFunction|DrawPath)
+  (CallFunction|PlaceHome)
+  ; report the result in the log
+  (Development|PrintString (Utilities|String|Append (Utilities|String|Append (Utilities|String|Append "ICE3 seed " (Utilities|String|ToString(Integer) (Variables|Default|GetSeed))) (select (Variables|Default|GetLoopOk) " | loop OK" " | loop FAILED")) (Utilities|String|Append " | path cells " (Utilities|String|ToString(Integer) (Utilities|Array|Length (Variables|Default|GetPathCells))))))
+  (Development|PrintString (Utilities|String|Append (Utilities|String|Append "slope limit used " (Utilities|String|ToString(Integer) (Math|Float|Round (Variables|Default|GetUsedSlopeDeg)))) (Utilities|String|Append " deg | steepest step " (Utilities|String|ToString(Integer) (Math|Float|Round (Variables|Default|GetWorstSlopeDeg))))))
+  )
+
+
+; ---------------------------------------------------------------------
+; GenerateHeights - fills Heights[] with terrain heights from Unreal's Perlin noise.
+; Every grid point (ix, iy) is sampled at position (ix, iy, 0); NoiseScale is the noise
+; frequency, so a small NoiseScale gives broad hills and a large one gives busy terrain.
+; Two noise layers are added (a broad one and a finer one at half strength) so the ground
+; has both big hills and small bumps. The Seed is fed into the noise as its RandomSeed,
+; so a different Seed gives different terrain and the same Seed always gives the same terrain.
+; The noise comes from Geometry Script's "Compute Perlin Noise" node (Unreal's own Perlin
+; implementation); Blueprints have no 2D Perlin node of their own.
+; ---------------------------------------------------------------------
+(fn GenerateHeights ()
+  (bind n (Variables|Default|GetMapSize))
+  ; 1. list every grid point as a position (Verts is used as scratch space here)
+  (Utilities|Array|Clear (Variables|Default|GetVerts))
+  (for ix (range n)
+    (for iy (range n)
+      (Utilities|Array|Add (Variables|Default|GetVerts) (Math|Vector|MakeVector (Math|Conversions|ToFloat(Integer) ix) (Math|Conversions|ToFloat(Integer) iy) 0.0))))
+  (bind posList (GeometryScript|ListUtils|ConvertArrayToVectorList (Variables|Default|GetVerts)))
+  ; 2. layer 1: broad hills
+  (bind s1 (GeometryScript|Deformations|ComputePerlinNoise posList (Utilities|Struct|MakeGeometryScriptPerlinNoiseOptions (Utilities|Struct|MakeGeometryScriptPerlinNoiseLayerOptions 1.0 (Variables|Default|GetNoiseScale) (Math|Vector|MakeVector 0.0 0.0 0.37) (Variables|Default|GetSeed)) false)))
+  (bind a1 (GeometryScript|ListUtils|ConvertScalarListToArray s1))
+  ; 3. layer 2: finer bumps at half strength and a higher frequency
+  (bind s2 (GeometryScript|Deformations|ComputePerlinNoise posList (Utilities|Struct|MakeGeometryScriptPerlinNoiseOptions (Utilities|Struct|MakeGeometryScriptPerlinNoiseLayerOptions 0.5 (* (Variables|Default|GetNoiseScale) 2.3) (Math|Vector|MakeVector 0.0 0.0 0.81) (+ (Variables|Default|GetSeed) 7919)) false)))
+  (bind a2 (GeometryScript|ListUtils|ConvertScalarListToArray s2))
+  ; 4. combine the layers and scale to world height
+  (Utilities|Array|Clear (Variables|Default|GetHeights))
+  (for i (range (* n n))
+    (Utilities|Array|Add (Variables|Default|GetHeights) (* (+ (Utilities|Array|Get(acopy) a1 i) (Utilities|Array|Get(acopy) a2 i)) (Variables|Default|GetHeightMultiplier))))
+  ; 5. remember the lowest and highest point (used to colour the terrain by height)
+  (Variables|Default|SetMinHeight 1000000.0)
+  (Variables|Default|SetMaxHeight -1000000.0)
+  (for j (range (* n n))
+    (if (< (Utilities|Array|Get(acopy) (Variables|Default|GetHeights) j) (Variables|Default|GetMinHeight))
+      (Variables|Default|SetMinHeight (Utilities|Array|Get(acopy) (Variables|Default|GetHeights) j)))
+    (if (> (Utilities|Array|Get(acopy) (Variables|Default|GetHeights) j) (Variables|Default|GetMaxHeight))
+      (Variables|Default|SetMaxHeight (Utilities|Array|Get(acopy) (Variables|Default|GetHeights) j)))))
+
+
+; ---------------------------------------------------------------------
+; HeightAt - terrain height at grid point (Col, Row). Points outside the map are clamped
+; to the nearest edge point, so neighbour lookups never go out of range.
+; ---------------------------------------------------------------------
+(fn HeightAt (Col Row)
+  (bind n (Variables|Default|GetMapSize))
+  (return (Utilities|Array|Get(acopy) (Variables|Default|GetHeights) (+ (* (select (< Col 0) 0 (select (> Col (- n 1)) (- n 1) Col)) n) (select (< Row 0) 0 (select (> Row (- n 1)) (- n 1) Row))))))
+
+
+; ---------------------------------------------------------------------
+; HeightColor - terrain colour for a relative height T (0 = lowest point, 1 = highest).
+; Blue-green lowlands -> green grass -> brown hills -> pale peaks.
+; ---------------------------------------------------------------------
+(fn HeightColor (T)
+  (if (< T 0.4)
+    (return (Math|Color|Lerp(LinearColor) (Math|Color|MakeColor 0.06 0.2 0.3 1.0) (Math|Color|MakeColor 0.13 0.42 0.12 1.0) (Math|Float|Clamp(Float) (/ T 0.4) 0.0 1.0)))
+    (elif (< T 0.75)
+      (return (Math|Color|Lerp(LinearColor) (Math|Color|MakeColor 0.13 0.42 0.12 1.0) (Math|Color|MakeColor 0.4 0.3 0.17 1.0) (Math|Float|Clamp(Float) (/ (- T 0.4) 0.35) 0.0 1.0)))
+      (else
+        (return (Math|Color|Lerp(LinearColor) (Math|Color|MakeColor 0.4 0.3 0.17 1.0) (Math|Color|MakeColor 0.9 0.9 0.92 1.0) (Math|Float|Clamp(Float) (/ (- T 0.75) 0.25) 0.0 1.0)))))))
+
+
+; ---------------------------------------------------------------------
+; BuildTerrainMesh - turns Heights[] into a visible terrain mesh (Terrain component).
+; One vertex per grid point (x = column * CellSize, y = row * CellSize, z = height).
+; Each grid square is two triangles. Vertex colours show height (see HeightColor).
+; Normals come from the height difference of the neighbouring points so the lighting
+; follows the slopes.
+; ---------------------------------------------------------------------
+(fn BuildTerrainMesh ()
+  (bind n (Variables|Default|GetMapSize))
+  (bind cs (Variables|Default|GetCellSize))
+  (Utilities|Array|Clear (Variables|Default|GetVerts))
+  (Utilities|Array|Clear (Variables|Default|GetNorms))
+  (Utilities|Array|Clear (Variables|Default|GetUVs))
+  (Utilities|Array|Clear (Variables|Default|GetVertColors))
+  (Utilities|Array|Clear (Variables|Default|GetTris))
+  (for ix (range n)
+    (for iy (range n)
+      ; vertex position
+      (Utilities|Array|Add (Variables|Default|GetVerts) (Math|Vector|MakeVector (* (Math|Conversions|ToFloat(Integer) ix) cs) (* (Math|Conversions|ToFloat(Integer) iy) cs) (CallFunction|HeightAt :Col ix :Row iy)))
+      ; normal from the neighbouring heights
+      (Utilities|Array|Add (Variables|Default|GetNorms) (Math|Vector|Normalize (Math|Vector|MakeVector (/ (- (CallFunction|HeightAt :Col (- ix 1) :Row iy) (CallFunction|HeightAt :Col (+ ix 1) :Row iy)) (* 2.0 cs)) (/ (- (CallFunction|HeightAt :Col ix :Row (- iy 1)) (CallFunction|HeightAt :Col ix :Row (+ iy 1))) (* 2.0 cs)) 1.0) 0.0001))
+      ; texture coordinates
+      (Utilities|Array|Add (Variables|Default|GetUVs) (Math|Vector2D|MakeVector2D (/ (Math|Conversions|ToFloat(Integer) ix) (Math|Conversions|ToFloat(Integer) (- n 1))) (/ (Math|Conversions|ToFloat(Integer) iy) (Math|Conversions|ToFloat(Integer) (- n 1)))))
+      ; colour from the relative height (0 = lowest point, 1 = highest point)
+      (Variables|Default|SetVertT (/ (- (Utilities|Array|Get(acopy) (Variables|Default|GetHeights) (+ (* ix n) iy)) (Variables|Default|GetMinHeight)) (+ (- (Variables|Default|GetMaxHeight) (Variables|Default|GetMinHeight)) 0.001)))
+      (Utilities|Array|Add (Variables|Default|GetVertColors) (CallFunction|HeightColor :T (Variables|Default|GetVertT)))))
+  ; two triangles per grid square; the corner order makes the visible face point up
+  ; (order: corner, +Y neighbour, +X neighbour)
+  (for tx (range (- n 1))
+    (for ty (range (- n 1))
+      (Utilities|Array|Add (Variables|Default|GetTris) (+ (* tx n) ty))
+      (Utilities|Array|Add (Variables|Default|GetTris) (+ (* tx n) (+ ty 1)))
+      (Utilities|Array|Add (Variables|Default|GetTris) (+ (* (+ tx 1) n) ty))
+      (Utilities|Array|Add (Variables|Default|GetTris) (+ (* (+ tx 1) n) ty))
+      (Utilities|Array|Add (Variables|Default|GetTris) (+ (* tx n) (+ ty 1)))
+      (Utilities|Array|Add (Variables|Default|GetTris) (+ (* (+ tx 1) n) (+ ty 1)))))
+  ; build the mesh section and apply the height-colour material
+  (Components|ProceduralMesh|CreateMeshSection :self (Variables|Default|GetTerrain) :SectionIndex 0 :Vertices (Variables|Default|GetVerts) :Triangles (Variables|Default|GetTris) :Normals (Variables|Default|GetNorms) :UV0 (Variables|Default|GetUVs) :VertexColors (Variables|Default|GetVertColors))
+  (Rendering|Material|SetMaterial (Variables|Default|GetTerrain) 0 "/Game/BottledTide/ICE3/M_ICE3_Terrain.M_ICE3_Terrain"))
+
+
+; ---------------------------------------------------------------------
+; BuildLoop - builds the looping route through the terrain, using the current SlopeLimit.
+;
+;   HOME (edge cell, middle of the west edge - the same place for every seed)
+;     -> waypoint A (north part of the map)
+;     -> waypoint B (far east side of the map)
+;     -> waypoint C (south part of the map)
+;     -> back to HOME
+;
+; The waypoints are aimed at fixed regions of the map, moved a little by the Seed, then
+; snapped to the flattest nearby cell. After the outward legs (HOME -> A -> B) the ground
+; around them is blocked, so the return legs (B -> C -> HOME) must use different ground:
+; the result is a visible loop. Each leg is found by FindLeg, which refuses steep steps.
+; Sets LoopOk = true only if every leg was found.
+; ---------------------------------------------------------------------
+(fn BuildLoop ()
+  (bind n (Variables|Default|GetMapSize))
+  (bind nf (Math|Conversions|ToFloat(Integer) n))
+  (Utilities|Array|Clear (Variables|Default|GetPathCells))
+  (CallFunction|ClearBlocked)
+  (Math|Random|SetRandomStreamSeed (Variables|Default|GetNoiseStream) (Variables|Default|GetSeed))
+  ; HOME: column 0 (the edge), middle row
+  (Variables|Default|SetHomeIdx (Math|Float|Truncate (* nf 0.5)))
+  ; waypoints: a target region plus a seeded offset, snapped to flat ground
+  (Variables|Default|SetWaypointA (CallFunction|PickWaypoint :TargetCol (Math|Float|Truncate (+ (* nf 0.32) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetNoiseStream) (* nf -0.06) (* nf 0.06)))) :TargetRow (Math|Float|Truncate (+ (* nf 0.82) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetNoiseStream) (* nf -0.06) (* nf 0.06))))))
+  (Variables|Default|SetWaypointB (CallFunction|PickWaypoint :TargetCol (Math|Float|Truncate (+ (* nf 0.84) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetNoiseStream) (* nf -0.05) (* nf 0.05)))) :TargetRow (Math|Float|Truncate (+ (* nf 0.5) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetNoiseStream) (* nf -0.08) (* nf 0.08))))))
+  (Variables|Default|SetWaypointC (CallFunction|PickWaypoint :TargetCol (Math|Float|Truncate (+ (* nf 0.32) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetNoiseStream) (* nf -0.06) (* nf 0.06)))) :TargetRow (Math|Float|Truncate (+ (* nf 0.18) (Math|Random|RandomFloatInRangeFromStream (Variables|Default|GetNoiseStream) (* nf -0.06) (* nf 0.06))))))
+  ; outward trip
+  (Variables|Default|SetLoopOk true)
+  (if (Variables|Default|GetLoopOk)
+    (Variables|Default|SetLoopOk (CallFunction|TryLeg :FromIdx (Variables|Default|GetHomeIdx) :ToIdx (Variables|Default|GetWaypointA))))
+  (if (Variables|Default|GetLoopOk)
+    (Variables|Default|SetLoopOk (CallFunction|TryLeg :FromIdx (Variables|Default|GetWaypointA) :ToIdx (Variables|Default|GetWaypointB))))
+  ; return trip: keep away from the ground already used
+  (if (Variables|Default|GetLoopOk)
+    (CallFunction|BlockAroundPath :Radius 2 :ExemptA (Variables|Default|GetHomeIdx) :ExemptB (Variables|Default|GetWaypointB)))
+  (if (Variables|Default|GetLoopOk)
+    (Variables|Default|SetLoopOk (CallFunction|TryLeg :FromIdx (Variables|Default|GetWaypointB) :ToIdx (Variables|Default|GetWaypointC))))
+  (if (Variables|Default|GetLoopOk)
+    (CallFunction|BlockAroundPath :Radius 2 :ExemptA (Variables|Default|GetHomeIdx) :ExemptB (Variables|Default|GetWaypointC)))
+  (if (Variables|Default|GetLoopOk)
+    (Variables|Default|SetLoopOk (CallFunction|TryLeg :FromIdx (Variables|Default|GetWaypointC) :ToIdx (Variables|Default|GetHomeIdx)))))
+
+
+; ---------------------------------------------------------------------
+; PickWaypoint - turns a rough target position into the FLATTEST grid cell nearby.
+; Looks at the 7x7 cells around (TargetCol, TargetRow), scores each by how much the height
+; changes towards its 4 neighbours, and returns the smoothest one. Waypoints on flat ground
+; are much less likely to be cut off by steep cliffs. Cells too close to the map edge are
+; skipped so the loop stays inside the map.
+; ---------------------------------------------------------------------
+(fn PickWaypoint (TargetCol TargetRow)
+  (bind n (Variables|Default|GetMapSize))
+  (Variables|Default|SetBestDist 1000000000.0)
+  (Variables|Default|SetBestIdx (+ (* TargetCol n) TargetRow))
+  (for dx (range -3 4)
+    (for dy (range -3 4)
+      ; candidate cell, kept 2 cells away from the map edge
+      (Variables|Default|SetNCol (select (< (+ TargetCol dx) 2) 2 (select (> (+ TargetCol dx) (- n 3)) (- n 3) (+ TargetCol dx))))
+      (Variables|Default|SetNRow (select (< (+ TargetRow dy) 2) 2 (select (> (+ TargetRow dy) (- n 3)) (- n 3) (+ TargetRow dy))))
+      ; roughness = total height change to the 4 neighbours
+      (Variables|Default|SetNewCost (+ (+ (Math|Float|Absolute(Float) (- (CallFunction|HeightAt :Col (Variables|Default|GetNCol) :Row (Variables|Default|GetNRow)) (CallFunction|HeightAt :Col (+ (Variables|Default|GetNCol) 1) :Row (Variables|Default|GetNRow)))) (Math|Float|Absolute(Float) (- (CallFunction|HeightAt :Col (Variables|Default|GetNCol) :Row (Variables|Default|GetNRow)) (CallFunction|HeightAt :Col (- (Variables|Default|GetNCol) 1) :Row (Variables|Default|GetNRow))))) (+ (Math|Float|Absolute(Float) (- (CallFunction|HeightAt :Col (Variables|Default|GetNCol) :Row (Variables|Default|GetNRow)) (CallFunction|HeightAt :Col (Variables|Default|GetNCol) :Row (+ (Variables|Default|GetNRow) 1)))) (Math|Float|Absolute(Float) (- (CallFunction|HeightAt :Col (Variables|Default|GetNCol) :Row (Variables|Default|GetNRow)) (CallFunction|HeightAt :Col (Variables|Default|GetNCol) :Row (- (Variables|Default|GetNRow) 1)))))))
+      (if (< (Variables|Default|GetNewCost) (Variables|Default|GetBestDist))
+        (Variables|Default|SetBestDist (Variables|Default|GetNewCost))
+        (Variables|Default|SetBestIdx (+ (* (Variables|Default|GetNCol) n) (Variables|Default|GetNRow))))))
+  (return (Variables|Default|GetBestIdx)))
+
+
+; ---------------------------------------------------------------------
+; TryLeg - finds one leg of the loop and adds it to the path. If the leg cannot be found
+; while avoiding the outward route (Blocked), it is tried once more with nothing blocked,
+; so the loop still gets back home even on cramped terrain. Returns true on success.
+; ---------------------------------------------------------------------
+(fn TryLeg (FromIdx ToIdx)
+  (bind ok1 (CallFunction|FindLeg :FromIdx FromIdx :ToIdx ToIdx))
+  (if ok1
+    (CallFunction|AppendLeg)
+    (return true)
+    (else
+      (CallFunction|ClearBlocked)
+      (bind ok2 (CallFunction|FindLeg :FromIdx FromIdx :ToIdx ToIdx))
+      (if ok2
+        (CallFunction|AppendLeg)
+        (return true)
+        (else
+          (return false))))))
+
+
+; ---------------------------------------------------------------------
+; FindLeg - finds the cheapest route from cell FromIdx to cell ToIdx (Dijkstra's algorithm).
+; A step to one of the 8 neighbours is only allowed if its slope (height change divided by
+; the horizontal distance) is at most SlopeLimit - that is how very steep ground is avoided.
+; The cost of a step is its length times (1 + 6 * slope), so the route also prefers flat
+; ground and detours around hills. Cells marked in Blocked are never used (this is what
+; forces the return trip to take a different way than the outward trip).
+; The route is left in LegCells (FromIdx first, ToIdx last). Returns Ok = false if no route.
+; ---------------------------------------------------------------------
+(fn FindLeg (FromIdx ToIdx)
+  (bind n (Variables|Default|GetMapSize))
+  (bind cs (Variables|Default|GetCellSize))
+  (CallFunction|ResetSearch)
+  (Utilities|Array|SetArrayElem (Variables|Default|GetDist) FromIdx 0.0 false)
+  (Utilities|Array|SetArrayElem (Variables|Default|GetCellState) FromIdx 1 false)
+  (Utilities|Array|Add (Variables|Default|GetFrontier) FromIdx)
+  (Variables|Default|SetLegOk false)
+  (while (and (> (Utilities|Array|Length (Variables|Default|GetFrontier)) 0) (not (Variables|Default|GetLegOk)))
+    ; take the waiting cell with the lowest cost so far
+    (Variables|Default|SetBestDist 1000000000.0)
+    (Variables|Default|SetBestIdx -1)
+    (for f (Variables|Default|GetFrontier)
+      (if (< (Utilities|Array|Get(acopy) (Variables|Default|GetDist) f) (Variables|Default|GetBestDist))
+        (Variables|Default|SetBestDist (Utilities|Array|Get(acopy) (Variables|Default|GetDist) f))
+        (Variables|Default|SetBestIdx f)))
+    (Variables|Default|SetCurIdx (Variables|Default|GetBestIdx))
+    (Utilities|Array|RemoveItem (Variables|Default|GetFrontier) (Variables|Default|GetCurIdx))
+    (Utilities|Array|SetArrayElem (Variables|Default|GetCellState) (Variables|Default|GetCurIdx) 2 false)
+    (if (== (Variables|Default|GetCurIdx) ToIdx)
+      (Variables|Default|SetLegOk true)
+      (else
+        ; column and row of the current cell (index = column * MapSize + row)
+        (Variables|Default|SetCurCol (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) (Variables|Default|GetCurIdx)) (Math|Conversions|ToFloat(Integer) n))))
+        (Variables|Default|SetCurRow (- (Variables|Default|GetCurIdx) (* (Variables|Default|GetCurCol) n)))
+        ; look at the 8 neighbours
+        (for dx (range -1 2)
+          (for dy (range -1 2)
+            (if (or (!= dx 0) (!= dy 0))
+              (Variables|Default|SetNCol (+ (Variables|Default|GetCurCol) dx))
+              (Variables|Default|SetNRow (+ (Variables|Default|GetCurRow) dy))
+              (if (and (and (>= (Variables|Default|GetNCol) 0) (< (Variables|Default|GetNCol) n)) (and (>= (Variables|Default|GetNRow) 0) (< (Variables|Default|GetNRow) n)))
+                (Variables|Default|SetNIdx (+ (* (Variables|Default|GetNCol) n) (Variables|Default|GetNRow)))
+                (if (and (!= (Utilities|Array|Get(acopy) (Variables|Default|GetCellState) (Variables|Default|GetNIdx)) 2) (== (Utilities|Array|Get(acopy) (Variables|Default|GetBlocked) (Variables|Default|GetNIdx)) 0))
+                  ; step length (a diagonal step is 1.414 times longer) and its slope
+                  (Variables|Default|SetStepLen (* cs (select (and (!= dx 0) (!= dy 0)) 1.41421 1.0)))
+                  (Variables|Default|SetStepSlope (/ (Math|Float|Absolute(Float) (- (Utilities|Array|Get(acopy) (Variables|Default|GetHeights) (Variables|Default|GetNIdx)) (Utilities|Array|Get(acopy) (Variables|Default|GetHeights) (Variables|Default|GetCurIdx)))) (Variables|Default|GetStepLen)))
+                  ; only steps that are not too steep are allowed
+                  (if (<= (Variables|Default|GetStepSlope) (Variables|Default|GetSlopeLimit))
+                    (Variables|Default|SetNewCost (+ (Utilities|Array|Get(acopy) (Variables|Default|GetDist) (Variables|Default|GetCurIdx)) (* (Variables|Default|GetStepLen) (+ 1.0 (* 6.0 (Variables|Default|GetStepSlope))))))
+                    (if (< (Variables|Default|GetNewCost) (Utilities|Array|Get(acopy) (Variables|Default|GetDist) (Variables|Default|GetNIdx)))
+                      (Utilities|Array|SetArrayElem (Variables|Default|GetDist) (Variables|Default|GetNIdx) (Variables|Default|GetNewCost) false)
+                      (Utilities|Array|SetArrayElem (Variables|Default|GetPrev) (Variables|Default|GetNIdx) (Variables|Default|GetCurIdx) false)
+                      (if (== (Utilities|Array|Get(acopy) (Variables|Default|GetCellState) (Variables|Default|GetNIdx)) 0)
+                        (Utilities|Array|SetArrayElem (Variables|Default|GetCellState) (Variables|Default|GetNIdx) 1 false)
+                        (Utilities|Array|Add (Variables|Default|GetFrontier) (Variables|Default|GetNIdx)))))))))))))
+  ; walk back from the goal to the start to read out the route
+  (Utilities|Array|Clear (Variables|Default|GetLegCells))
+  (if (Variables|Default|GetLegOk)
+    (Variables|Default|SetCurIdx ToIdx)
+    (while (!= (Variables|Default|GetCurIdx) FromIdx)
+      (Utilities|Array|Add (Variables|Default|GetLegCells) (Variables|Default|GetCurIdx))
+      (Variables|Default|SetCurIdx (Utilities|Array|Get(acopy) (Variables|Default|GetPrev) (Variables|Default|GetCurIdx))))
+    (Utilities|Array|Add (Variables|Default|GetLegCells) FromIdx)
+    (Utilities|Array|Reverse (Variables|Default|GetLegCells)))
+  (return (Variables|Default|GetLegOk)))
+
+
+; ---------------------------------------------------------------------
+; ResetSearch - clears the working arrays used by the path search.
+; Dist = best known cost to reach each cell (huge = not reached), Prev = the cell we came
+; from, CellState = 0 untouched / 1 waiting to be explored / 2 finished.
+; ---------------------------------------------------------------------
+(fn ResetSearch ()
+  (bind n (Variables|Default|GetMapSize))
+  (Utilities|Array|Clear (Variables|Default|GetDist))
+  (Utilities|Array|Clear (Variables|Default|GetPrev))
+  (Utilities|Array|Clear (Variables|Default|GetCellState))
+  (Utilities|Array|Clear (Variables|Default|GetFrontier))
+  (for i (range (* n n))
+    (Utilities|Array|Add (Variables|Default|GetDist) 1000000000.0)
+    (Utilities|Array|Add (Variables|Default|GetPrev) -1)
+    (Utilities|Array|Add (Variables|Default|GetCellState) 0)))
+
+
+; ---------------------------------------------------------------------
+; AppendLeg - adds the route just found (LegCells) to the end of PathCells.
+; The first cell of a later leg is the last cell of the previous one, so it is skipped.
+; ---------------------------------------------------------------------
+(fn AppendLeg ()
+  (for i (range (Utilities|Array|Length (Variables|Default|GetLegCells)))
+    (if (or (> i 0) (== (Utilities|Array|Length (Variables|Default|GetPathCells)) 0))
+      (Utilities|Array|Add (Variables|Default|GetPathCells) (Utilities|Array|Get(acopy) (Variables|Default|GetLegCells) i)))))
+
+
+; ---------------------------------------------------------------------
+; ClearBlocked - sets every cell to "not blocked" (also sizes the Blocked array).
+; ---------------------------------------------------------------------
+(fn ClearBlocked ()
+  (bind n (Variables|Default|GetMapSize))
+  (Utilities|Array|Clear (Variables|Default|GetBlocked))
+  (for i (range (* n n))
+    (Utilities|Array|Add (Variables|Default|GetBlocked) 0)))
+
+
+; ---------------------------------------------------------------------
+; BlockAroundPath - marks every cell within Radius of the path so far as Blocked.
+; The search will not enter Blocked cells, so the next leg has to find a different way
+; and the finished route is a real loop, not the same road there and back.
+; Cells within 5 of ExemptA and ExemptB are un-blocked again so the new leg can still
+; connect to where it starts and ends (for example back to the home cell).
+; ---------------------------------------------------------------------
+(fn BlockAroundPath (Radius ExemptA ExemptB)
+  (bind n (Variables|Default|GetMapSize))
+  (Utilities|Array|Clear (Variables|Default|GetBlocked))
+  (for i (range (* n n))
+    (Utilities|Array|Add (Variables|Default|GetBlocked) 0))
+  ; block a square of cells around every path cell
+  (for p (Variables|Default|GetPathCells)
+    (Variables|Default|SetCurCol (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) p) (Math|Conversions|ToFloat(Integer) n))))
+    (Variables|Default|SetCurRow (- p (* (Variables|Default|GetCurCol) n)))
+    (for dx (range (- 0 Radius) (+ Radius 1))
+      (for dy (range (- 0 Radius) (+ Radius 1))
+        (Variables|Default|SetNCol (+ (Variables|Default|GetCurCol) dx))
+        (Variables|Default|SetNRow (+ (Variables|Default|GetCurRow) dy))
+        (if (and (and (>= (Variables|Default|GetNCol) 0) (< (Variables|Default|GetNCol) n)) (and (>= (Variables|Default|GetNRow) 0) (< (Variables|Default|GetNRow) n)))
+          (Utilities|Array|SetArrayElem (Variables|Default|GetBlocked) (+ (* (Variables|Default|GetNCol) n) (Variables|Default|GetNRow)) 1 false)))))
+  ; open the exempt zones again
+  (bind ac (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) ExemptA) (Math|Conversions|ToFloat(Integer) n))))
+  (bind ar (- ExemptA (* ac n)))
+  (bind bc (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) ExemptB) (Math|Conversions|ToFloat(Integer) n))))
+  (bind br (- ExemptB (* bc n)))
+  (for k (range (* n n))
+    (Variables|Default|SetCurCol (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) k) (Math|Conversions|ToFloat(Integer) n))))
+    (Variables|Default|SetCurRow (- k (* (Variables|Default|GetCurCol) n)))
+    (if (or (and (<= (Math|Integer|Absolute(Integer) (- (Variables|Default|GetCurCol) ac)) 5) (<= (Math|Integer|Absolute(Integer) (- (Variables|Default|GetCurRow) ar)) 5)) (and (<= (Math|Integer|Absolute(Integer) (- (Variables|Default|GetCurCol) bc)) 5) (<= (Math|Integer|Absolute(Integer) (- (Variables|Default|GetCurRow) br)) 5)))
+      (Utilities|Array|SetArrayElem (Variables|Default|GetBlocked) k 0 false))))
+
+
+; ---------------------------------------------------------------------
+; CellPos - world position (relative to this actor) of grid cell Idx, lifted 22 cm above the
+; ground so the road markers sit on top of the terrain instead of inside it.
+; ---------------------------------------------------------------------
+(fn CellPos (Idx)
+  (bind n (Variables|Default|GetMapSize))
+  (bind col (Math|Float|Truncate (/ (Math|Conversions|ToFloat(Integer) Idx) (Math|Conversions|ToFloat(Integer) n))))
+  (return (Math|Vector|MakeVector (* (Math|Conversions|ToFloat(Integer) col) (Variables|Default|GetCellSize)) (* (Math|Conversions|ToFloat(Integer) (- Idx (* col n))) (Variables|Default|GetCellSize)) (+ (Utilities|Array|Get(acopy) (Variables|Default|GetHeights) Idx) 22.0))))
+
+
+; ---------------------------------------------------------------------
+; DrawPath - draws the route as a continuous yellow road: one flat box between each pair of
+; consecutive path cells, tilted to follow the slope. Also measures the finished route:
+;   PathLengthCm  = total length
+;   WorstSlopeDeg = the steepest single step actually used (should stay <= the slope limit)
+; ---------------------------------------------------------------------
+(fn DrawPath ()
+  (Components|InstancedStaticMesh|ClearInstances (Variables|Default|GetPathRoad))
+  (Variables|Default|SetPathLengthCm 0.0)
+  (Variables|Default|SetWorstSlopeDeg 0.0)
+  (for i (range (- (Utilities|Array|Length (Variables|Default|GetPathCells)) 1))
+    (bind pa (CallFunction|CellPos :Idx (Utilities|Array|Get(acopy) (Variables|Default|GetPathCells) i)))
+    (bind pb (CallFunction|CellPos :Idx (Utilities|Array|Get(acopy) (Variables|Default|GetPathCells) (+ i 1))))
+    (Variables|Default|SetStepLen (Math|Vector|Distance(Vector) pa pb))
+    (Variables|Default|SetPathLengthCm (+ (Variables|Default|GetPathLengthCm) (Variables|Default|GetStepLen)))
+    (Variables|Default|SetStepSlope (Math|Trig|Atan(Degrees) (/ (Math|Float|Absolute(Float) (- (.z pb) (.z pa))) (Math|Vector|Distance2D(Vector) pa pb))))
+    (if (> (Variables|Default|GetStepSlope) (Variables|Default|GetWorstSlopeDeg))
+      (Variables|Default|SetWorstSlopeDeg (Variables|Default|GetStepSlope)))
+    (Components|InstancedStaticMesh|AddInstance (Variables|Default|GetPathRoad) (Math|Transform|MakeTransform (* (+ pa pb) 0.5) (Math|Rotator|FindLookatRotation pa pb) (Math|Vector|MakeVector (* (/ (Variables|Default|GetStepLen) 100.0) 1.08) 0.45 0.12)) false)))
+
+
+; ---------------------------------------------------------------------
+; PlaceHome - marks the home / spawn area, which is BOTH the start and the end of the loop.
+; A tall magenta beacon plus a wide flat pad sit on the home cell at the map edge. Two
+; labels lie flat above the map so a top-down screenshot can read them:
+;   HomeText : "HOME (start / end)" next to the beacon
+;   SeedText : "Seed: 1001" plus the loop result, above the middle of the top edge
+; The labels are rotated (pitch 90, yaw 180) so they face up and read the right way round
+; when the editor camera looks straight down with +X pointing up the screen. Their size and
+; colour are set here in code so they never depend on saved instance data.
+; ---------------------------------------------------------------------
+(fn PlaceHome ()
+  (Components|StaticMesh|SetStaticMesh (Variables|Default|GetHomeMarker) "/Engine/BasicShapes/Cylinder.Cylinder")
+  (Rendering|Material|SetMaterial (Variables|Default|GetHomeMarker) 0 "/Game/BottledTide/ICE3/M_ICE3_Home.M_ICE3_Home")
+  (Components|InstancedStaticMesh|ClearInstances (Variables|Default|GetHomeMarker))
+  (bind hp (CallFunction|CellPos :Idx (Variables|Default|GetHomeIdx)))
+  ; beacon (tall thin cylinder) and pad (wide flat cylinder)
+  (Components|InstancedStaticMesh|AddInstance (Variables|Default|GetHomeMarker) (Math|Transform|MakeTransform (+ hp (Math|Vector|MakeVector 0.0 0.0 600.0)) (Math|Rotator|MakeRotator 0.0 0.0 0.0) (Math|Vector|MakeVector 0.7 0.7 12.0)) false)
+  (Components|InstancedStaticMesh|AddInstance (Variables|Default|GetHomeMarker) (Math|Transform|MakeTransform (+ hp (Math|Vector|MakeVector 0.0 0.0 6.0)) (Math|Rotator|MakeRotator 0.0 0.0 0.0) (Math|Vector|MakeVector 6.0 6.0 0.15)) false)
+  ; HOME label
+  (Transformation|SetRelativeLocationAndRotation (Variables|Default|GetHomeText) (+ hp (Math|Vector|MakeVector 350.0 350.0 900.0)) (Math|Rotator|MakeRotator 0.0 90.0 180.0))
+  (Rendering|Components|TextRender|SetWorldSize (Variables|Default|GetHomeText) 110.0)
+  (Rendering|Components|TextRender|SetTextRenderColor (Variables|Default|GetHomeText) (Utilities|Struct|MakeColor 170 0 120 255))
+  (Rendering|Components|TextRender|SetText (Variables|Default|GetHomeText) (Utilities|Text|ToText(String) "HOME (start / end)"))
+  ; SEED label
+  (Transformation|SetRelativeLocationAndRotation (Variables|Default|GetSeedText) (Math|Vector|MakeVector (* (* (Math|Conversions|ToFloat(Integer) (Variables|Default|GetMapSize)) (Variables|Default|GetCellSize)) 1.1) (* (* (Math|Conversions|ToFloat(Integer) (Variables|Default|GetMapSize)) (Variables|Default|GetCellSize)) 0.5) (+ (Variables|Default|GetMaxHeight) 900.0)) (Math|Rotator|MakeRotator 0.0 90.0 180.0))
+  (Rendering|Components|TextRender|SetWorldSize (Variables|Default|GetSeedText) 150.0)
+  (Rendering|Components|TextRender|SetTextRenderColor (Variables|Default|GetSeedText) (Utilities|Struct|MakeColor 10 20 90 255))
+  (Rendering|Components|TextRender|SetText (Variables|Default|GetSeedText) (Utilities|Text|ToText(String) (Utilities|String|Append (Utilities|String|Append (Utilities|String|Append "Seed: " (Utilities|String|ToString(Integer) (Variables|Default|GetSeed))) (select (Variables|Default|GetLoopOk) "   loop OK" "   LOOP FAILED")) (Utilities|String|Append "   steepest step: " (Utilities|String|ToString(Integer) (Math|Float|Round (Variables|Default|GetWorstSlopeDeg)))))))
+  )

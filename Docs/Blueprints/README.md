@@ -13,6 +13,7 @@ from. Lines starting with `;` are comments.
 | `BP_GameHUD.bp.txt` | Fragment counter, objective line, tier, end screen |
 | `BP_Player.bp.txt` | First-person walking and looking, no combat |
 | `BP_ReturnZone.bp.txt` | Trigger volume around the ship |
+| `BP_PerlinNoiseTerrain.bp.txt` | ICE Task 3: Perlin noise terrain and looping path (separate from the game, see `Docs/ICE3/`) |
 
 ## Design in one paragraph
 
